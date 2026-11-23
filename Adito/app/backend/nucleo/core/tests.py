@@ -414,6 +414,120 @@ class IndexacaoIncrementalTests(AppDbTestCase):
         self.assertEqual(self._indexados(), 2)
 
 
+class BaseConhecimentoTests(AppDbTestCase):
+    """Aba Base de conhecimento: lista do app.db, item manual, remoção e reindex que mantém os manuais."""
+
+    def setUp(self):
+        super().setUp()
+        pasta = tempfile.TemporaryDirectory()
+        self.addCleanup(pasta.cleanup)
+        base = Path(pasta.name)
+        dados_db = base / "dados.db"
+        conn = sqlite3.connect(dados_db)
+        conn.execute("CREATE TABLE t (ano INTEGER, area TEXT)")
+        conn.execute("INSERT INTO t VALUES (2024, 'Exatas')")
+        conn.commit()
+        conn.close()
+        self.folder = base / "contexts" / "ctx-teste"
+        self.folder.mkdir(parents=True)
+        (self.folder / "views.json").write_text(json.dumps({
+            "contexto": "ctx-teste", "nome": "Contexto teste", "views": [{"name": "t", "description": "Tabela."}],
+        }), encoding="utf-8")
+        (self.folder / "rules.md").write_text("Total: COUNT(*)\n", encoding="utf-8")
+        (self.folder / "examples.json").write_text(json.dumps([
+            {"question": "Total por ano?", "sql": "SELECT ano, COUNT(*) FROM t GROUP BY ano"},
+            {"question": "Total por área?", "sql": "SELECT area, COUNT(*) FROM t GROUP BY area"},
+        ]), encoding="utf-8")
+        env = patch.dict(os.environ, {
+            "ADITO_DATA_DIR": str(base), "ADITO_DADOS_DB": str(dados_db), "GEMINI_API_KEY": "chave-falsa",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        p = patch("rpc.admin.get_embedder", return_value=EmbedderFalso())
+        p.start()
+        self.addCleanup(p.stop)
+        load_handlers()
+        _, tenant = session.current()
+        self.ctx, _, erros = load_context_dir(self.folder, tenant)
+        self.assertEqual(erros, [])
+
+    def _lista(self):
+        status, itens = call("admin.trainings.list")
+        self.assertEqual(status, 200, itens)
+        return itens
+
+    def test_reindex_gera_itens_do_contexto_e_bate_com_o_status(self):
+        status, body = call("admin.trainings.retrain", {"contexto": self.ctx.id})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["contextos"][0]["indexado"], body)
+        itens = self._lista()
+        self.assertEqual(sorted(i["type"] for i in itens), ["ddl", "documentation", "sql", "sql"])
+        self.assertTrue(all(i["contexto_slug"] == "ctx-teste" and i["origem"] == "contexto" for i in itens))
+        self.assertIn("Esquema das views — Contexto teste", {i["name"] for i in itens})
+        _, sistema = call("admin.system_status")
+        stats = sistema["systemStats"]
+        self.assertEqual((stats["trainedDdl"], stats["trainedDoc"], stats["trainedExamples"]), (1, 1, 2))
+
+    def test_item_manual_persiste_sobrevive_ao_reindex_e_pode_ser_removido(self):
+        call("admin.trainings.retrain", {"contexto": self.ctx.id})
+        status, novo = call("admin.trainings.create", {
+            "type": "sql", "question": "Quantas linhas?", "content": "SELECT COUNT(*) FROM t", "contexto": self.ctx.id,
+        })
+        self.assertEqual(status, 200, novo)
+        self.assertEqual((novo["origem"], novo["contexto_nome"]), ("manual", "Contexto teste"))
+
+        # Reindex: os gerados são refeitos, o manual fica.
+        gerados_antes = {i["id"] for i in self._lista() if i["origem"] == "contexto"}
+        status, body = call("admin.trainings.retrain", {"contexto": self.ctx.id})
+        self.assertEqual(body["contextos"][0]["manuais_mantidos"], 1)
+        itens = self._lista()
+        self.assertIn(novo["id"], {i["id"] for i in itens})
+        self.assertFalse(gerados_antes & {i["id"] for i in itens if i["origem"] == "contexto"})
+        self.assertEqual(len(itens), 5)
+
+        status, body = call("admin.trainings.delete", {"id": novo["id"]})
+        self.assertEqual(status, 200, body)
+        self.assertNotIn(novo["id"], {i["id"] for i in self._lista()})
+        self.assertEqual(call("admin.trainings.delete", {"id": novo["id"]})[0], 404)
+
+    def test_create_sem_chave_do_gemini_devolve_aviso_claro(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
+            status, body = call("admin.trainings.create", {"type": "documentation", "content": "Regra qualquer."})
+        self.assertEqual(status, 400, body)
+        self.assertIn("chave do Gemini", body["detail"])
+
+    def test_item_sem_contexto_vale_para_todos_e_contexto_invalido_recusa(self):
+        status, novo = call("admin.trainings.create", {"type": "documentation", "content": "Bolsista é aluno com bolsa."})
+        self.assertEqual(status, 200, novo)
+        self.assertIsNone(novo["contexto"])
+        self.assertEqual(novo["origem"], "manual")
+        status, _ = call("admin.trainings.create", {
+            "type": "documentation", "content": "x", "contexto": "00000000-0000-0000-0000-000000000000",
+        })
+        self.assertEqual(status, 400)
+
+    def test_reindex_sem_chave_recusa(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
+            status, _ = call("admin.trainings.retrain", {"contexto": self.ctx.id})
+        self.assertEqual(status, 400)
+
+    def test_reindex_com_cota_esgotada_devolve_mensagem_clara(self):
+        from analytics_index.embedder import CotaEsgotada
+
+        class SemCota:
+            def embed_documents(self, texts):
+                raise CotaEsgotada("A cota diária da chave do Gemini acabou.")
+
+            embed_query = embed_documents
+
+        with patch("rpc.admin.get_embedder", return_value=SemCota()):
+            status, body = call("admin.trainings.retrain", {"contexto": self.ctx.id})
+        self.assertEqual(status, 200, body)
+        erro = body["contextos"][0]["erros"][0]
+        self.assertFalse(body["contextos"][0]["indexado"])
+        self.assertIn("cota diária", erro)
+
+
 class ChaveGeminiTests(AppDbTestCase):
     """Teste da chave do Gemini antes de guardá-la no cofre (config.test_llm_key)."""
 
@@ -1263,6 +1377,42 @@ class QaAccuracyGuardsTests(unittest.TestCase):
 
         self.assertIn("Do NOT add extra WHERE filters", BASE_SQL_RULES)
         self.assertIn("explicit tie-breaker", BASE_SQL_RULES)
+
+    def test_examples_json_validos_e_top16_cobre_todas_as_views(self) -> None:
+        from agents.bi_agent.nodes.sql_validator import validate_read_only_sql
+
+        ctx_dir = RAIZ_REPO / "Adito" / "app" / "contexts" / "pesquisa-extensao-ifes"
+        views_spec = json.loads((ctx_dir / "views.json").read_text(encoding="utf-8"))
+        allowed = [v["name"] for v in views_spec["views"]]
+        examples = json.loads((ctx_dir / "examples.json").read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(len(examples), 16)
+        for idx, ex in enumerate(examples, start=1):
+            self.assertTrue(ex.get("question"), f"Exemplo #{idx} sem question")
+            self.assertTrue(ex.get("sql"), f"Exemplo #{idx} sem sql")
+            ok, motivo = validate_read_only_sql(ex["sql"], allowed)
+            self.assertTrue(ok, f"Exemplo #{idx} inválido: {motivo}")
+
+        top16_sql = "\n".join(ex["sql"].lower() for ex in examples[:16])
+        for view_name in allowed:
+            self.assertIn(view_name.lower(), top16_sql, f"View {view_name} ausente do top-16 de fallback")
+
+    def test_examples_json_executam_com_linhas_no_dados_db(self) -> None:
+        from core.datastore import connect_dados
+
+        dados_db = RAIZ_REPO / "Adito" / "app" / "data" / "dados.db"
+        if not dados_db.is_file():
+            self.skipTest("dados.db não encontrado no ambiente de teste")
+
+        examples = json.loads(
+            (RAIZ_REPO / "Adito" / "app" / "contexts" / "pesquisa-extensao-ifes" / "examples.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with connect_dados(path=dados_db) as conn:
+            for idx, ex in enumerate(examples, start=1):
+                rows = conn.execute(ex["sql"]).fetchall()
+                self.assertGreater(len(rows), 0, f"Exemplo #{idx} retornou 0 linhas: {ex['question']}")
 
     def _run_extractor(self, system_prompt: str, fake_items: dict[str, list]) -> str:
         from types import SimpleNamespace

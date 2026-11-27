@@ -20,13 +20,19 @@ def sql_corrector(
     log_node_start("corrector", f"tentativa={attempt} erro={error[:160]!r}")
 
     question = state.get("rewritten_user_input") or state.get("user_input", "")
-    # Mesmo contexto do gerador: sem a pergunta e o esquema, a correção podia mudar o sentido da consulta.
-    system_content = (
+    # Mesmo prefixo fixo do gerador no início para aproveitar cache de prefixo entre tentativas.
+    parts: list[str] = []
+    static_prompt = (state.get("system_prompt") or "").strip()
+    if static_prompt:
+        parts.append(static_prompt)
+    parts.append(
         f"You are a SQL expert for the {dialect.upper()} database. Fix the query so it answers the question.\n\n"
-        f"Write the explanation field in Brazilian Portuguese.\n\n"
-        f"RETRIEVED CONTEXT:\n{state.get('retrieved_schema', '')}\n\n"
-        f"{state.get('system_prompt', '')}"
+        f"Write the explanation field in Brazilian Portuguese."
     )
+    retrieved_context = (state.get("retrieved_schema") or "").strip()
+    if retrieved_context:
+        parts.append(f"RETRIEVED CONTEXT:\n{retrieved_context}")
+    system_content = "\n\n".join(parts)
     prompt = (
         f"Question: {question}\n"
         f"The {dialect} query failed.\n"

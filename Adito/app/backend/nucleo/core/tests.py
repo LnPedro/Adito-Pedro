@@ -1478,6 +1478,71 @@ class AgentesRevisaoTests(unittest.TestCase):
         self.assertIn("CREATE VIEW v (campus TEXT)", sistema.content)
         self.assertIn("regras do contexto", sistema.content)
         self.assertIn("quantos projetos por campus?", humano.content)
+        self.assertLess(
+            sistema.content.index("regras do contexto"),
+            sistema.content.index("RETRIEVED CONTEXT:"),
+        )
+
+    def test_prompts_sql_colocam_bloco_fixo_antes_do_contexto_variavel(self):
+        from langchain_core.messages import HumanMessage
+
+        from agents.bi_agent.config import SQLResponse
+        from agents.bi_agent.nodes.sql_corrector import sql_corrector
+        from agents.bi_agent.nodes.sql_generator import sql_generator
+
+        estruturado = MagicMock()
+        estruturado.invoke.return_value = SQLResponse(sql="SELECT 1", explanation="ok", reasoning="r")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = estruturado
+
+        bloco_fixo = "BASE_RULES\nALLOWED VIEWS:\n- v(a)\nBUSINESS RULES:\nregra fixa"
+        exemplos_rag = "### Exemplo SQL\nPergunta: x\nSQL: SELECT 1"
+
+        sql_generator(
+            {
+                "user_input": "quantos registros?",
+                "messages": [HumanMessage(content="quantos registros?")],
+                "retrieved_schema": exemplos_rag,
+                "system_prompt": bloco_fixo,
+            },
+            llm_model=llm,
+            dialect="sqlite",
+        )
+        gen_system = estruturado.invoke.call_args[0][0][0].content
+
+        sql_corrector(
+            {
+                "validation_result": {"error": "syntax error"},
+                "generated_sql": "SELECT FROM v",
+                "user_input": "quantos registros?",
+                "retrieved_schema": exemplos_rag,
+                "system_prompt": bloco_fixo,
+                "allowed_views": ["v"],
+            },
+            llm_model=llm,
+            dialect="sqlite",
+        )
+        corr_system = estruturado.invoke.call_args[0][0][0].content
+
+        for content in (gen_system, corr_system):
+            self.assertTrue(content.startswith(bloco_fixo))
+            self.assertLess(content.index(bloco_fixo), content.index("RETRIEVED CONTEXT:"))
+            self.assertIn(exemplos_rag, content)
+
+        # Sem retrieved_schema, não inclui seção vazia de RETRIEVED CONTEXT
+        sql_generator(
+            {
+                "user_input": "quantos registros?",
+                "messages": [HumanMessage(content="quantos registros?")],
+                "retrieved_schema": "   ",
+                "system_prompt": bloco_fixo,
+            },
+            llm_model=llm,
+            dialect="sqlite",
+        )
+        gen_sem_rag = estruturado.invoke.call_args[0][0][0].content
+        self.assertTrue(gen_sem_rag.startswith(bloco_fixo))
+        self.assertNotIn("RETRIEVED CONTEXT:", gen_sem_rag)
 
     def test_prompt_do_resolvedor_sem_vendas(self):
         from agents.bi_agent.config import BI_VALUE_RESOLVER_SYSTEM_PROMPT as prompt

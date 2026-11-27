@@ -25,13 +25,21 @@ def sql_generator(
 ) -> dict[str, str]:
     user_input = state.get("rewritten_user_input") or state["user_input"]
     log_node_start("generator", f"pergunta usada={user_input[:120]!r}")
-    system_content = (
+    # Bloco fixo (regras + DDL + rules.md) antes do bloco variável (exemplos RAG)
+    # para preservar prefixo estável e habilitar cache automático de prefixo no provedor LLM.
+    parts: list[str] = []
+    static_prompt = (state.get("system_prompt") or "").strip()
+    if static_prompt:
+        parts.append(static_prompt)
+    parts.append(
         f"You are a SQL expert for the {dialect.upper()} database.\n"
-        f"Use the CONTEXT below to generate the best possible query.\n\n"
-        f"Write the explanation field in Brazilian Portuguese. Keep SQL unchanged in valid {dialect.upper()}.\n\n"
-        f"RETRIEVED CONTEXT:\n{state['retrieved_schema']}\n\n"
-        f"{state.get('system_prompt', '')}"
+        f"Use the rules/schema above and the retrieved examples below to generate the best possible query.\n\n"
+        f"Write the explanation field in Brazilian Portuguese. Keep SQL unchanged in valid {dialect.upper()}."
     )
+    retrieved_context = (state.get("retrieved_schema") or "").strip()
+    if retrieved_context:
+        parts.append(f"RETRIEVED CONTEXT:\n{retrieved_context}")
+    system_content = "\n\n".join(parts)
 
     messages = [SystemMessage(content=system_content)]
     messages.extend(_messages_with_current_question(state["messages"], user_input))
